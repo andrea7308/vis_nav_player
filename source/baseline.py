@@ -14,6 +14,10 @@ import pickle
 import networkx as nx
 from sklearn.cluster import KMeans
 from tqdm import tqdm
+import torch
+import clip
+from PIL import Image
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -30,111 +34,132 @@ MIN_SHORTCUT_GAP = 50       # minimum trajectory index gap for shortcuts
 
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-
-# ---------------------------------------------------------------------------
-# VLAD Feature Extraction
-# ---------------------------------------------------------------------------
-class VLADExtractor:
-    """RootSIFT + VLAD with intra-normalization and power normalization."""
-
-    def __init__(self, n_clusters: int = 128):
-        self.n_clusters = n_clusters
-        self.sift = cv2.SIFT_create()
-        self.codebook = None
-        self._sift_cache: dict[str, np.ndarray] = {}
-
-    @property
-    def dim(self) -> int:
-        return self.n_clusters * 128
-
-    # --- Internal helpers ---
-
-    @staticmethod
-    def _root_sift(des: np.ndarray) -> np.ndarray:
-        """L1-normalize then sqrt (Hellinger kernel approximation)."""
-        des = des / np.sum(des, axis=1, keepdims=True)
-        return np.sqrt(des)
-
-    def _des_to_vlad(self, des: np.ndarray) -> np.ndarray:
-        """Aggregate local descriptors into a single VLAD vector."""
-        labels = self.codebook.predict(des)
-        centers = self.codebook.cluster_centers_
-        k = self.codebook.n_clusters
-        vlad = np.zeros((k, des.shape[1]))
-        for i in range(k):
-            mask = labels == i
-            if np.any(mask):
-                vlad[i] = np.sum(des[mask] - centers[i], axis=0)
-                norm = np.linalg.norm(vlad[i])
-                if norm > 0:
-                    vlad[i] /= norm                     # intra-normalization
-        vlad = vlad.ravel()
-        vlad = np.sign(vlad) * np.sqrt(np.abs(vlad))   # power normalization
-        norm = np.linalg.norm(vlad)
-        if norm > 0:
-            vlad /= norm                                # L2 normalization
-        return vlad
-
-    # --- Public API ---
-
-    def load_sift_cache(self, file_list: list[str], subsample_rate: int):
-        """Load or compute RootSIFT descriptors for all images."""
-        cache_file = os.path.join(CACHE_DIR, f"sift_ss{subsample_rate}.pkl")
-        if os.path.exists(cache_file):
-            print(f"Loading cached SIFT from {cache_file}")
-            with open(cache_file, "rb") as f:
-                self._sift_cache = pickle.load(f)
-            if all(fname in self._sift_cache for fname in file_list):
-                return
-            print("  Cache incomplete, re-extracting...")
-
-        print(f"Extracting SIFT for {len(file_list)} images...")
-        self._sift_cache = {}
-        for fname in tqdm(file_list, desc="SIFT"):
-            img = cv2.imread(os.path.join(IMAGE_DIR, fname))
-            _, des = self.sift.detectAndCompute(img, None)
-            if des is not None:
-                self._sift_cache[fname] = self._root_sift(des)
-        with open(cache_file, "wb") as f:
-            pickle.dump(self._sift_cache, f)
-        print(f"  Saved {len(self._sift_cache)} descriptors -> {cache_file}")
-
-    def build_vocabulary(self, file_list: list[str]):
-        """Fit KMeans codebook on cached SIFT descriptors."""
-        cache_file = os.path.join(CACHE_DIR, f"codebook_k{self.n_clusters}.pkl")
-        if os.path.exists(cache_file):
-            print(f"Loading cached codebook from {cache_file}")
-            with open(cache_file, "rb") as f:
-                self.codebook = pickle.load(f)
-            return
-
-        all_des = np.vstack([self._sift_cache[f] for f in file_list
-                             if f in self._sift_cache])
-        print(f"Fitting KMeans (k={self.n_clusters}) on {len(all_des)} descriptors...")
-        self.codebook = KMeans(
-            n_clusters=self.n_clusters, init='k-means++',
-            n_init=3, max_iter=300, tol=1e-4, verbose=1, random_state=42,
-        ).fit(all_des)
-        print(f"  {self.codebook.n_iter_} iters, inertia={self.codebook.inertia_:.0f}")
-        with open(cache_file, "wb") as f:
-            pickle.dump(self.codebook, f)
+class CLIPExtractor:
+    def __init__(self, device="cpu"):
+        self.device = device
+        self.model, self.preprocess = clip.load("ViT-B/32", device=device)
 
     def extract(self, img: np.ndarray) -> np.ndarray:
-        """Compute VLAD for a single BGR image."""
-        _, des = self.sift.detectAndCompute(img, None)
-        if des is None or len(des) == 0:
-            return np.zeros(self.dim)
-        return self._des_to_vlad(self._root_sift(des))
+        img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        x = self.preprocess(img).unsqueeze(0).to(self.device)
 
-    def extract_batch(self, file_list: list[str]) -> np.ndarray:
-        """Compute VLAD for all images using cached SIFT. Returns (N, dim)."""
-        vectors = []
-        for fname in tqdm(file_list, desc="VLAD"):
-            if fname in self._sift_cache and len(self._sift_cache[fname]) > 0:
-                vectors.append(self._des_to_vlad(self._sift_cache[fname]))
-            else:
-                vectors.append(np.zeros(self.dim))
-        return np.array(vectors)
+        with torch.no_grad():
+            feat = self.model.encode_image(x)
+
+        feat = feat / feat.norm(dim=-1, keepdim=True)  # normalize
+        return feat.cpu().numpy().flatten()
+
+    def extract_batch(self, file_list):
+        feats = []
+        for fname in tqdm(file_list, desc="CLIP"):
+            img = cv2.imread(os.path.join(IMAGE_DIR, fname))
+            feats.append(self.extract(img))
+        return np.array(feats)
+
+# # ---------------------------------------------------------------------------
+# # VLAD Feature Extraction
+# # ---------------------------------------------------------------------------
+# class VLADExtractor:
+#     """RootSIFT + VLAD with intra-normalization and power normalization."""
+
+#     def __init__(self, n_clusters: int = 128):
+#         self.n_clusters = n_clusters
+#         self.sift = cv2.SIFT_create()
+#         self.codebook = None
+#         self._sift_cache: dict[str, np.ndarray] = {}
+
+#     @property
+#     def dim(self) -> int:
+#         return self.n_clusters * 128
+
+#     # --- Internal helpers ---
+
+#     @staticmethod
+#     def _root_sift(des: np.ndarray) -> np.ndarray:
+#         """L1-normalize then sqrt (Hellinger kernel approximation)."""
+#         des = des / np.sum(des, axis=1, keepdims=True)
+#         return np.sqrt(des)
+
+#     def _des_to_vlad(self, des: np.ndarray) -> np.ndarray:
+#         """Aggregate local descriptors into a single VLAD vector."""
+#         labels = self.codebook.predict(des)
+#         centers = self.codebook.cluster_centers_
+#         k = self.codebook.n_clusters
+#         vlad = np.zeros((k, des.shape[1]))
+#         for i in range(k):
+#             mask = labels == i
+#             if np.any(mask):
+#                 vlad[i] = np.sum(des[mask] - centers[i], axis=0)
+#                 norm = np.linalg.norm(vlad[i])
+#                 if norm > 0:
+#                     vlad[i] /= norm                     # intra-normalization
+#         vlad = vlad.ravel()
+#         vlad = np.sign(vlad) * np.sqrt(np.abs(vlad))   # power normalization
+#         norm = np.linalg.norm(vlad)
+#         if norm > 0:
+#             vlad /= norm                                # L2 normalization
+#         return vlad
+
+#     # --- Public API ---
+
+#     def load_sift_cache(self, file_list: list[str], subsample_rate: int):
+#         """Load or compute RootSIFT descriptors for all images."""
+#         cache_file = os.path.join(CACHE_DIR, f"sift_ss{subsample_rate}.pkl")
+#         if os.path.exists(cache_file):
+#             print(f"Loading cached SIFT from {cache_file}")
+#             with open(cache_file, "rb") as f:
+#                 self._sift_cache = pickle.load(f)
+#             if all(fname in self._sift_cache for fname in file_list):
+#                 return
+#             print("  Cache incomplete, re-extracting...")
+
+#         print(f"Extracting SIFT for {len(file_list)} images...")
+#         self._sift_cache = {}
+#         for fname in tqdm(file_list, desc="SIFT"):
+#             img = cv2.imread(os.path.join(IMAGE_DIR, fname))
+#             _, des = self.sift.detectAndCompute(img, None)
+#             if des is not None:
+#                 self._sift_cache[fname] = self._root_sift(des)
+#         with open(cache_file, "wb") as f:
+#             pickle.dump(self._sift_cache, f)
+#         print(f"  Saved {len(self._sift_cache)} descriptors -> {cache_file}")
+
+#     def build_vocabulary(self, file_list: list[str]):
+#         """Fit KMeans codebook on cached SIFT descriptors."""
+#         cache_file = os.path.join(CACHE_DIR, f"codebook_k{self.n_clusters}.pkl")
+#         if os.path.exists(cache_file):
+#             print(f"Loading cached codebook from {cache_file}")
+#             with open(cache_file, "rb") as f:
+#                 self.codebook = pickle.load(f)
+#             return
+
+#         all_des = np.vstack([self._sift_cache[f] for f in file_list
+#                              if f in self._sift_cache])
+#         print(f"Fitting KMeans (k={self.n_clusters}) on {len(all_des)} descriptors...")
+#         self.codebook = KMeans(
+#             n_clusters=self.n_clusters, init='k-means++',
+#             n_init=3, max_iter=300, tol=1e-4, verbose=1, random_state=42,
+#         ).fit(all_des)
+#         print(f"  {self.codebook.n_iter_} iters, inertia={self.codebook.inertia_:.0f}")
+#         with open(cache_file, "wb") as f:
+#             pickle.dump(self.codebook, f)
+
+#     def extract(self, img: np.ndarray) -> np.ndarray:
+#         """Compute VLAD for a single BGR image."""
+#         _, des = self.sift.detectAndCompute(img, None)
+#         if des is None or len(des) == 0:
+#             return np.zeros(self.dim)
+#         return self._des_to_vlad(self._root_sift(des))
+
+#     def extract_batch(self, file_list: list[str]) -> np.ndarray:
+#         """Compute VLAD for all images using cached SIFT. Returns (N, dim)."""
+#         vectors = []
+#         for fname in tqdm(file_list, desc="VLAD"):
+#             if fname in self._sift_cache and len(self._sift_cache[fname]) > 0:
+#                 vectors.append(self._des_to_vlad(self._sift_cache[fname]))
+#             else:
+#                 vectors.append(np.zeros(self.dim))
+#         return np.array(vectors)
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +195,8 @@ class KeyboardPlayerPyGame(Player):
             print(f"Frames: {len(all_motion)} total, "
                   f"{len(self.motion_frames)} after {subsample_rate}x subsample")
 
-        self.extractor = VLADExtractor(n_clusters=n_clusters)
+        # self.extractor = VLADExtractor(n_clusters=n_clusters)
+        self.extractor = CLIPExtractor(device="cpu")
         self.database = None
         self.G = None
         self.goal_node = None
@@ -237,14 +263,23 @@ class KeyboardPlayerPyGame(Player):
         self._build_graph()
         self._setup_goal()
 
-    # --- VLAD database ---
+    # # --- VLAD database ---
+    # def _build_database(self):
+    #     """Compute VLAD database (skips if already done)."""
+    #     if self.database is not None:
+    #         print("Database already computed, skipping.")
+    #         return
+    #     self.extractor.load_sift_cache(self.file_list, self.subsample_rate)
+    #     self.extractor.build_vocabulary(self.file_list)
+    #     self.database = self.extractor.extract_batch(self.file_list)
+    #     print(f"Database: {self.database.shape}")
+
     def _build_database(self):
-        """Compute VLAD database (skips if already done)."""
         if self.database is not None:
             print("Database already computed, skipping.")
             return
-        self.extractor.load_sift_cache(self.file_list, self.subsample_rate)
-        self.extractor.build_vocabulary(self.file_list)
+
+        print("Extracting CLIP features...")
         self.database = self.extractor.extract_batch(self.file_list)
         print(f"Database: {self.database.shape}")
 
