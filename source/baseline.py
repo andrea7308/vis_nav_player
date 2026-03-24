@@ -38,6 +38,7 @@ class CLIPExtractor:
     def __init__(self, device="cpu"):
         self.device = device
         self.model, self.preprocess = clip.load("ViT-B/32", device=device)
+        self.prev_node = None
 
     def extract(self, img: np.ndarray) -> np.ndarray:
         img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
@@ -55,112 +56,6 @@ class CLIPExtractor:
             img = cv2.imread(os.path.join(IMAGE_DIR, fname))
             feats.append(self.extract(img))
         return np.array(feats)
-
-# # ---------------------------------------------------------------------------
-# # VLAD Feature Extraction
-# # ---------------------------------------------------------------------------
-# class VLADExtractor:
-#     """RootSIFT + VLAD with intra-normalization and power normalization."""
-
-#     def __init__(self, n_clusters: int = 128):
-#         self.n_clusters = n_clusters
-#         self.sift = cv2.SIFT_create()
-#         self.codebook = None
-#         self._sift_cache: dict[str, np.ndarray] = {}
-
-#     @property
-#     def dim(self) -> int:
-#         return self.n_clusters * 128
-
-#     # --- Internal helpers ---
-
-#     @staticmethod
-#     def _root_sift(des: np.ndarray) -> np.ndarray:
-#         """L1-normalize then sqrt (Hellinger kernel approximation)."""
-#         des = des / np.sum(des, axis=1, keepdims=True)
-#         return np.sqrt(des)
-
-#     def _des_to_vlad(self, des: np.ndarray) -> np.ndarray:
-#         """Aggregate local descriptors into a single VLAD vector."""
-#         labels = self.codebook.predict(des)
-#         centers = self.codebook.cluster_centers_
-#         k = self.codebook.n_clusters
-#         vlad = np.zeros((k, des.shape[1]))
-#         for i in range(k):
-#             mask = labels == i
-#             if np.any(mask):
-#                 vlad[i] = np.sum(des[mask] - centers[i], axis=0)
-#                 norm = np.linalg.norm(vlad[i])
-#                 if norm > 0:
-#                     vlad[i] /= norm                     # intra-normalization
-#         vlad = vlad.ravel()
-#         vlad = np.sign(vlad) * np.sqrt(np.abs(vlad))   # power normalization
-#         norm = np.linalg.norm(vlad)
-#         if norm > 0:
-#             vlad /= norm                                # L2 normalization
-#         return vlad
-
-#     # --- Public API ---
-
-#     def load_sift_cache(self, file_list: list[str], subsample_rate: int):
-#         """Load or compute RootSIFT descriptors for all images."""
-#         cache_file = os.path.join(CACHE_DIR, f"sift_ss{subsample_rate}.pkl")
-#         if os.path.exists(cache_file):
-#             print(f"Loading cached SIFT from {cache_file}")
-#             with open(cache_file, "rb") as f:
-#                 self._sift_cache = pickle.load(f)
-#             if all(fname in self._sift_cache for fname in file_list):
-#                 return
-#             print("  Cache incomplete, re-extracting...")
-
-#         print(f"Extracting SIFT for {len(file_list)} images...")
-#         self._sift_cache = {}
-#         for fname in tqdm(file_list, desc="SIFT"):
-#             img = cv2.imread(os.path.join(IMAGE_DIR, fname))
-#             _, des = self.sift.detectAndCompute(img, None)
-#             if des is not None:
-#                 self._sift_cache[fname] = self._root_sift(des)
-#         with open(cache_file, "wb") as f:
-#             pickle.dump(self._sift_cache, f)
-#         print(f"  Saved {len(self._sift_cache)} descriptors -> {cache_file}")
-
-#     def build_vocabulary(self, file_list: list[str]):
-#         """Fit KMeans codebook on cached SIFT descriptors."""
-#         cache_file = os.path.join(CACHE_DIR, f"codebook_k{self.n_clusters}.pkl")
-#         if os.path.exists(cache_file):
-#             print(f"Loading cached codebook from {cache_file}")
-#             with open(cache_file, "rb") as f:
-#                 self.codebook = pickle.load(f)
-#             return
-
-#         all_des = np.vstack([self._sift_cache[f] for f in file_list
-#                              if f in self._sift_cache])
-#         print(f"Fitting KMeans (k={self.n_clusters}) on {len(all_des)} descriptors...")
-#         self.codebook = KMeans(
-#             n_clusters=self.n_clusters, init='k-means++',
-#             n_init=3, max_iter=300, tol=1e-4, verbose=1, random_state=42,
-#         ).fit(all_des)
-#         print(f"  {self.codebook.n_iter_} iters, inertia={self.codebook.inertia_:.0f}")
-#         with open(cache_file, "wb") as f:
-#             pickle.dump(self.codebook, f)
-
-#     def extract(self, img: np.ndarray) -> np.ndarray:
-#         """Compute VLAD for a single BGR image."""
-#         _, des = self.sift.detectAndCompute(img, None)
-#         if des is None or len(des) == 0:
-#             return np.zeros(self.dim)
-#         return self._des_to_vlad(self._root_sift(des))
-
-#     def extract_batch(self, file_list: list[str]) -> np.ndarray:
-#         """Compute VLAD for all images using cached SIFT. Returns (N, dim)."""
-#         vectors = []
-#         for fname in tqdm(file_list, desc="VLAD"):
-#             if fname in self._sift_cache and len(self._sift_cache[fname]) > 0:
-#                 vectors.append(self._des_to_vlad(self._sift_cache[fname]))
-#             else:
-#                 vectors.append(np.zeros(self.dim))
-#         return np.array(vectors)
-
 
 # ---------------------------------------------------------------------------
 # Player
@@ -233,6 +128,7 @@ class KeyboardPlayerPyGame(Player):
         return self.last_act
 
     def see(self, fpv):
+        print("STATE:", self._state)
         if fpv is None or len(fpv.shape) < 3:
             return
         self.fpv = fpv
@@ -243,10 +139,9 @@ class KeyboardPlayerPyGame(Player):
 
         pygame.display.set_caption("KeyboardPlayer:fpv")
 
-        if self._state and self._state[1] == Phase.NAVIGATION:
-            keys = pygame.key.get_pressed()
-            if keys[pygame.K_q]:
-                self.display_next_best_view()
+
+        if self.database is not None and self.G is not None and self.goal_node is not None:
+            self.display_next_best_view()
 
         rgb = fpv[:, :, ::-1]
         surface = pygame.image.frombuffer(rgb.tobytes(), rgb.shape[1::-1], 'RGB')
@@ -263,16 +158,6 @@ class KeyboardPlayerPyGame(Player):
         self._build_graph()
         self._setup_goal()
 
-    # # --- VLAD database ---
-    # def _build_database(self):
-    #     """Compute VLAD database (skips if already done)."""
-    #     if self.database is not None:
-    #         print("Database already computed, skipping.")
-    #         return
-    #     self.extractor.load_sift_cache(self.file_list, self.subsample_rate)
-    #     self.extractor.build_vocabulary(self.file_list)
-    #     self.database = self.extractor.extract_batch(self.file_list)
-    #     print(f"Database: {self.database.shape}")
 
     def _build_database(self):
         if self.database is not None:
@@ -298,40 +183,43 @@ class KeyboardPlayerPyGame(Player):
         for i in range(n - 1):
             self.G.add_edge(i, i + 1, weight=TEMPORAL_WEIGHT, edge_type="temporal")
 
-        # Visual shortcut edges: global top-K most similar pairs
+        # --- Visual edges: k-NN graph (CLIP-friendly) ---
         print("Computing similarity matrix...")
         sim = self.database @ self.database.T
-        np.fill_diagonal(sim, -2)
+        np.fill_diagonal(sim, -1)
 
-        # Mask nearby pairs + lower triangle
+        k = 10  # try 5–20
+        print(f"Building k-NN graph (k={k})...")
+
+        edge_count = 0
+
         for i in range(n):
+            sim_i = sim[i].copy()
+
+            # remove temporal neighbors
             lo = max(0, i - MIN_SHORTCUT_GAP)
             hi = min(n, i + MIN_SHORTCUT_GAP + 1)
-            sim[i, lo:hi] = -2
-        sim[~np.triu(np.ones((n, n), dtype=bool), k=1)] = -2
+            sim_i[lo:hi] = -1
 
-        # Extract top-K
-        flat = sim.ravel()
-        top_k = self.top_k_shortcuts
-        top_idx = np.argpartition(flat, -top_k)[-top_k:]
-        top_idx = top_idx[np.argsort(-flat[top_idx])]
+            # top-k neighbors
+            nn_idx = np.argpartition(sim_i, -k)[-k:]
 
-        dists = []
-        print(f"Top-{top_k} shortcuts (min_gap={MIN_SHORTCUT_GAP}):")
-        for rank, fi in enumerate(top_idx):
-            i, j = divmod(int(fi), n)
-            s = float(flat[fi])
-            d = float(np.sqrt(max(0, 2 - 2 * s)))
-            self.G.add_edge(i, j,
-                            weight=VISUAL_WEIGHT_BASE + VISUAL_WEIGHT_SCALE * d,
-                            edge_type="visual")
-            dists.append(d)
-            if rank < 5:
-                print(f"  #{rank+1}: {i}<->{j} gap={abs(j-i)} d={d:.4f}")
+            for j in nn_idx:
+                s = float(sim_i[j])
 
-        kd = np.array(dists)
-        print(f"  {top_k} visual edges, dist: [{kd.min():.3f}, {kd.max():.3f}]")
-        print(f"Graph: {self.G.number_of_nodes()} nodes, {self.G.number_of_edges()} edges")
+                if s <= 0:  # skip weak matches
+                    continue
+
+                d = float(np.sqrt(max(0, 2 - 2 * s)))
+
+                self.G.add_edge(
+                    i, j,
+                    weight=1.0 + 2.0 * d,
+                    edge_type="visual"
+                )
+                edge_count += 1
+
+        print(f"Added ~{edge_count} visual edges")
 
     # --- Goal ---
 
@@ -343,8 +231,13 @@ class KeyboardPlayerPyGame(Player):
         targets = self.get_target_images()
         if not targets:
             return
-        sims = self.database @ self.extractor.extract(targets[0])
-        self.goal_node = int(np.argmax(sims))
+        feat = self.extractor.extract(targets[0])
+        sims = self.database @ feat
+
+        k = 3
+        topk = np.argpartition(sims, -k)[-k:]
+        self.goal_node = int(np.median(topk))
+        
         d = float(np.sqrt(max(0, 2 - 2 * sims[self.goal_node])))
         print(f"Goal: node {self.goal_node} (d={d:.4f})")
 
@@ -354,16 +247,44 @@ class KeyboardPlayerPyGame(Player):
         if 0 <= idx < len(self.file_list):
             return cv2.imread(os.path.join(IMAGE_DIR, self.file_list[idx]))
         return None
-
+    
     def _get_current_node(self) -> int:
-        """Find best-matching database node for current FPV."""
         feat = self.extractor.extract(self.fpv)
-        return int(np.argmax(self.database @ feat))
+        sims = self.database @ feat
 
+        # take top-k instead of single best
+        k = 5
+        topk = np.argpartition(sims, -k)[-k:]
+
+        node = int(np.median(topk))
+
+        if self.prev_node is not None:
+            if abs(node - self.prev_node) > 50:
+                node = self.prev_node  # reject jump
+
+        self.prev_node = node
+        return node
+    
     def _get_path(self, start: int) -> list[int]:
-        """Shortest path from start to goal_node."""
+        """Shortest path with goal-directed weighting."""
         try:
-            return nx.shortest_path(self.G, start, self.goal_node, weight="weight")
+            def edge_cost(u, v, d):
+                base = d["weight"]
+
+                # similarity to goal (higher = better)
+                sim_v = float(self.database[v] @ self.database[self.goal_node])
+
+                # convert to penalty (lower cost if closer to goal)
+                goal_bias = 1.0 - sim_v  # in [0, 2]
+
+                return base + 0.5 * goal_bias  # tune 0.3–1.0
+
+            return nx.shortest_path(
+                self.G,
+                start,
+                self.goal_node,
+                weight=edge_cost
+            )
         except nx.NetworkXNoPath:
             return [start]
 
