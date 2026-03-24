@@ -1,263 +1,220 @@
-
-from vis_nav_game import Player, Action, Phase
-import pygame
-import cv2
-import numpy as np
-import os
-import pickle
-import networkx as nx
 import torch
-import torch.nn as nn
-import torchvision.models as models
-import torchvision.transforms as transforms
+import pickle
+import numpy as np
+import networkx as nx
 from PIL import Image
+import torchvision.transforms as transforms
+from torchvision.models import resnet18, ResNet18_Weights
+from vis_nav_game import Player, Action, Phase
+import vis_nav_game
+import cv2
+import pygame
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-CACHE_DIR = "cache"
-IMAGE_DIR = "data/images/"
-DATA_INFO_PATH = "data/data_info.json"
-
-# Graph construction
-TEMPORAL_WEIGHT = 1.0       # edge weight for consecutive frames
-VISUAL_WEIGHT_BASE = 2.0    # base weight for visual shortcut edges
-VISUAL_WEIGHT_SCALE = 3.0   # weight += scale * vlad_distance
-MIN_SHORTCUT_GAP = 50       # minimum trajectory index gap for shortcuts
-
-os.makedirs(CACHE_DIR, exist_ok=True)
-
-
-# ---------------------------------------------------------------------------
-# VLAD Feature Extraction
-# ---------------------------------------------------------------------------
-
-class CNNFeatureExtractor:
-    def __init__(self):
+class CNNAutonomousPlayer(Player):
+    def __init__(self, map_path="map_data.pkl"):
+        super().__init__()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Initializing CNN on: {self.device}")
-
-        # Load pre-trained ResNet-18
-        weights = models.ResNet18_Weights.IMAGENET1K_V1
-        resnet = models.resnet18(weights=weights)
+        print(f"Using device: {self.device}")
         
-        # Strip classification layer
-        self.model = nn.Sequential(*list(resnet.children())[:-1])
-        self.model = self.model.to(self.device)
+        # 1. Load CNN
+        base_model = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+        self.model = torch.nn.Sequential(*list(base_model.children())[:-1]).to(self.device)
         self.model.eval()
-
-        self.preprocess = transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
+        self.transform = transforms.Compose([
+            transforms.Resize((224, 224)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                                 std=[0.229, 0.224, 0.225]),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
 
-    def extract(self, img_array: np.ndarray) -> np.ndarray:
-        """Converts an OpenCV BGR image array into a 1D feature vector."""
-        if img_array is None or img_array.size == 0:
-            return np.zeros(512)
-
-        # Convert BGR (OpenCV) to RGB (PIL)
-        img_rgb = cv2.cvtColor(img_array, cv2.COLOR_BGR2RGB)
-        pil_img = Image.fromarray(img_rgb)
+        # 2. Load Map
+        with open(map_path, 'rb') as f:
+            self.G = pickle.load(f)
         
-        img_tensor = self.preprocess(pil_img).unsqueeze(0).to(self.device)
+        # Build a feature matrix for fast cosine similarity lookups
+        self.num_nodes = self.G.number_of_nodes()
+        # Ensure we are extracting the exact node IDs present in the graph
+        self.node_ids = list(self.G.nodes())
+        self.map_features = np.zeros((self.num_nodes, 512)) # ResNet18 output size
+        
+        for idx, node_id in enumerate(self.node_ids):
+            self.map_features[idx] = self.G.nodes[node_id]['features']
+            
+        # Initialize state variables
+        self.reset()
+        self.waiting_printed = False
 
-        with torch.no_grad():
-            feature = self.model(img_tensor).squeeze().cpu().numpy()
-            norm = np.linalg.norm(feature)
-            if norm > 0:
-                feature = feature / norm
-        return feature
-
-
-# ---------------------------------------------------------------------------
-# Player
-# ---------------------------------------------------------------------------
-class AutonomousPlayer(Player):
-
-    def __init__(self):
+    def reset(self):
+        """Required by the vis_nav_game engine. Clears state between runs."""
+        # Initialize pygame just to keep the OS window manager from freezing
+        pygame.init() 
+        
         self.fpv = None
-        self.screen = None
-        self.exploration_quit_sent = False 
-        
-        # Closed-Loop Navigation trackers
-        self.path_calculated = False
-        self.waypoint_queue = []         
-        self.expected_current_node = None 
-        
-        # NEW: Tracks how many times we've spun looking for a landmark
-        self.scan_spins = 0  
-        
-        super().__init__()
+        self.current_node = None
+        self.target_node = None
+        self.expected_next_node = None
+        self.action_queue = []
+        self.tick_count = 0
 
-        self.extractor = CNNFeatureExtractor()
-        self.G = None
-        self.goal_node = None
+    def _extract_features(self, img_array):
+        """Converts BGR numpy array (from cv2/game) to CNN features"""
+        # The game might pass None if it hasn't fully loaded the view yet
+        if img_array is None:
+            return np.zeros(512)
+            
+        img = Image.fromarray(cv2.cvtColor(img_array, cv2.COLOR_BGR2RGB))
+        tensor = self.transform(img).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            return self.model(tensor).flatten().cpu().numpy()
+
+    def set_target_images(self, images):
+        """Game engine hook that gets called when target images are ready."""
+        super().set_target_images(images)
+        self._find_target_node()
+
+    def pre_navigation(self):
+        super().pre_navigation()
+        self._find_target_node()
+
+    def _find_target_node(self):
+        """Safely attempts to locate the target node."""
+        if self.target_node is not None:
+            return # Target already found
+
+        targets = self.get_target_images()
+        if not targets: # Prevents the 'NoneType' crash!
+            return 
         
-        self.action_map = {
+        best_sim = -1
+        for tgt_img in targets:
+            if tgt_img is None:
+                continue
+            tgt_feat = self._extract_features(tgt_img)
+            # Cosine similarity against all map nodes
+            sims = np.dot(self.map_features, tgt_feat) / (np.linalg.norm(self.map_features, axis=1) * np.linalg.norm(tgt_feat))
+            max_idx = np.argmax(sims)
+            
+            if sims[max_idx] > best_sim:
+                best_sim = sims[max_idx]
+                self.target_node = self.node_ids[max_idx]
+                
+        if self.target_node is not None:
+            print(f"Target located at node {self.target_node} with similarity {best_sim:.2f}")
+
+    def see(self, fpv):
+        self.fpv = fpv
+        # CRITICAL: We must pump the OS event loop every frame to prevent freezing!
+        if fpv is not None and fpv.size > 0:
+            cv2.imshow("CNN Autonomous Navigator", fpv)
+            cv2.waitKey(1)
+
+    def act(self):
+        # --- OS ANTI-FREEZE ---
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                return Action.QUIT
+        # ----------------------
+
+        # --- THE HEARTBEAT ---
+        self.tick_count += 1
+        if self.tick_count % 60 == 0:
+            phase_name = self._state[1] if self._state else "None"
+            print(f"[Heartbeat] Engine is alive. Current Phase: {phase_name}")
+        # ---------------------
+
+        # 0. Wait for the game engine and camera to initialize
+        if self._state is None or self.fpv is None:
+            return Action.IDLE
+
+        phase = self._state[1]
+
+        # 1. SKIP EXPLORATION PHASE
+        if phase == Phase.EXPLORATION:
+            # We must send QUIT (Escape) exactly ONCE to skip the phase. 
+            # If we send it twice, it will accidentally close the entire game.
+            if not hasattr(self, 'skip_sent'):
+                self.skip_sent = True
+                print("\n>>> Sending QUIT once to safely skip exploration phase... <<<\n")
+                return Action.QUIT
+            
+            # Stand still while the engine processes the skip and transitions phases
+            return Action.IDLE
+
+        # 2. NAVIGATION PHASE
+        if phase == Phase.NAVIGATION:
+            # 2a. Find Target
+            if self.target_node is None:
+                self._find_target_node()
+                if self.target_node is None:
+                    return Action.IDLE
+
+            # 2b. Localize
+            if self.current_node is None:
+                current_feat = self._extract_features(self.fpv)
+                sims = np.dot(self.map_features, current_feat) / (np.linalg.norm(self.map_features, axis=1) * np.linalg.norm(current_feat))
+                max_idx = np.argmax(sims)
+                self.current_node = self.node_ids[max_idx]
+                print(f"Spawned at node {self.current_node} (Sim: {sims[max_idx]:.2f})")
+            elif len(self.action_queue) == 0 and self.expected_next_node is not None:
+                self.current_node = self.expected_next_node
+
+            # 2c. Plan & Move
+            if not self.action_queue:
+                if self.current_node == self.target_node:
+                    if not getattr(self, 'arrived_printed', False):
+                        print("\n*** ARRIVED AT TARGET LOCATION! ***\n")
+                        self.arrived_printed = True
+                    # In vis_nav_game, QUIT stops the clock and ends the run successfully.
+                    return Action.QUIT 
+                
+                try:
+                    UG = self.G.to_undirected()
+                    path = nx.shortest_path(UG, source=self.current_node, target=self.target_node)
+                    
+                    if len(path) > 1:
+                        next_node = path[1]
+                        self.expected_next_node = next_node
+                        
+                        if self.G.has_edge(self.current_node, next_node):
+                            act_str = self.G.edges[self.current_node, next_node]['action']
+                        else:
+                            act_str = self.G.edges[next_node, self.current_node]['action']
+                            act_str = self._reverse_action(act_str)
+                        
+                        self._queue_action(act_str)
+                    else:
+                        return Action.IDLE
+                    
+                except nx.NetworkXNoPath:
+                    if not getattr(self, 'path_error_printed', False):
+                        print(f"No path from {self.current_node} to target {self.target_node}!")
+                        self.path_error_printed = True
+                    return Action.IDLE
+
+            # 2d. Execute Control
+            if self.action_queue:
+                return self.action_queue.pop(0)
+                
+        return Action.IDLE
+
+
+    def _queue_action(self, act_str):
+        mapping = {
             'FORWARD': Action.FORWARD,
             'BACKWARD': Action.BACKWARD,
             'LEFT': Action.LEFT,
             'RIGHT': Action.RIGHT
         }
+        
+        act = mapping.get(act_str, Action.IDLE)
+        
+        # Only add actual physical movements to the queue! 
+        # This prevents the agent from standing still to process "IDLE" frames.
+        if act != Action.IDLE:
+            self.action_queue.append(act)
 
-    # --- Game engine hooks ---
-    def reset(self):
-        self.fpv = None
-        self.screen = None
-        self.exploration_quit_sent = False
-        self.path_calculated = False
-        self.waypoint_queue = []
-        self.expected_current_node = None
-        self.scan_spins = 0
-        pygame.init()
-
-    def see(self, fpv):
-        if fpv is None or len(fpv.shape) < 3:
-            return
-        self.fpv = fpv
-
-        if self.screen is None:
-            h, w, _ = fpv.shape
-            self.screen = pygame.display.set_mode((w, h))
-            pygame.display.set_caption("Autonomous Agent FPV")
-
-        rgb = fpv[:, :, ::-1]
-        surface = pygame.image.frombuffer(rgb.tobytes(), rgb.shape[1::-1], 'RGB')
-        self.screen.blit(surface, (0, 0))
-        pygame.display.update()
-
-    def pre_navigation(self):
-        super().pre_navigation()
-        self._load_map()
-        self._setup_goal()
-
-    def act(self):
-        pygame.event.clear()
-
-        if not self._state:
-            return Action.IDLE
-
-        if self._state[1] == Phase.EXPLORATION:
-            if not self.exploration_quit_sent:
-                self.exploration_quit_sent = True
-                return Action.QUIT
-            return Action.IDLE
-
-        if self._state[1] != Phase.NAVIGATION:
-            return Action.IDLE
-
-        # --- NAVIGATION PHASE LOGIC ---
-        current_feature = self.extractor.extract(self.fpv)
-
-        # 1. REALITY CHECK: Did we hit a wall or get lost?
-        if self.path_calculated and self.expected_current_node is not None:
-            expected_feature = self.G.nodes[self.expected_current_node].get('feature')
-            
-            if expected_feature is not None:
-                sim = np.dot(current_feature, expected_feature)
-                
-                # Dropped threshold to 0.55 so it doesn't panic on minor misalignments
-                if sim < 0.55:
-                    print(f"Reality Check Failed! (Sim: {sim:.2f}). Expected Node {self.expected_current_node}.")
-                    print("Illusion broken! Dropping path and turning to clear our view...")
-                    self.path_calculated = False
-                    self.waypoint_queue = []
-                    self.expected_current_node = None
-                    
-                    # Force a turn! This prevents the robot from continuously ramming the wall.
-                    return Action.LEFT
-
-        # 2. Path Planning (Only runs at start, or if a Reality Check fails)
-        if not self.path_calculated:
-            start_node, sim = self._find_closest_node(current_feature)
-            print(f"Localized current position at Node {start_node} (Confidence: {sim:.2f})")
-
-            # CONFIDENCE GATE: Do not trust aliases or bad guesses!
-            if sim < 0.80:
-                self.scan_spins += 1
-                if self.scan_spins >= 4:
-                    print("360 scan complete, still lost. Moving forward to find a landmark...")
-                    self.scan_spins = 0
-                    return Action.FORWARD
-                else:
-                    print(f"Confidence {sim:.2f} < 0.80. Scanning the area...")
-                    return Action.LEFT
-
-            # If we pass the confidence gate, reset spins and proceed!
-            self.scan_spins = 0
-
-            if start_node == self.goal_node:
-                return Action.CHECKIN
-
-            try:
-                path = nx.shortest_path(self.G, source=start_node, target=self.goal_node, weight='weight')
-                self.waypoint_queue = []
-                
-                # Build the queue of actions
-                for i in range(len(path) - 1):
-                    u = path[i]
-                    v = path[i+1]
-                    edge_data = self.G.get_edge_data(u, v)
-                    if edge_data and 'action' in edge_data:
-                        self.waypoint_queue.append((v, self.action_map[edge_data['action']]))
-                
-                self.expected_current_node = start_node
-                self.path_calculated = True
-
-            except nx.NetworkXNoPath:
-                print(f"No path found from {start_node}! Taking a random step to get a better view...")
-                return Action.FORWARD
-
-        # 3. Execution: Pop the next step
-        if self.waypoint_queue:
-            if self.expected_current_node == self.goal_node:
-                return Action.CHECKIN
-
-            next_node, action_to_take = self.waypoint_queue.pop(0)
-            print(f"Moving to Node {next_node} | Executing: {action_to_take.name}")
-            
-            # Update our expectation for the NEXT frame
-            self.expected_current_node = next_node
-            return action_to_take
-            
-        else:
-            if self.expected_current_node == self.goal_node:
-                print("Destination reached! Checking in.")
-                return Action.CHECKIN
-            return Action.IDLE
-
-    # --- Setup & Localization Helpers ---
-    def _load_map(self):
-        map_path = 'cache/topological_map.pkl'
-        if not os.path.exists(map_path):
-            raise FileNotFoundError(f"Could not find {map_path}.")
-        with open(map_path, 'rb') as f:
-            self.G = pickle.load(f)
-
-    def _setup_goal(self):
-        targets = self.get_target_images()
-        if not targets: return
-        goal_feature = self.extractor.extract(targets[0])
-        self.goal_node, sim = self._find_closest_node(goal_feature)
-        print(f"Goal localized at Node {self.goal_node} (Confidence: {sim:.2f})")
-
-    def _find_closest_node(self, target_feature):
-        best_node = None
-        max_sim = -1.0
-        for node_id, data in self.G.nodes(data=True):
-            if 'feature' in data:
-                sim = np.dot(target_feature, data['feature'])
-                if sim > max_sim:
-                    max_sim = sim
-                    best_node = node_id
-        return best_node, max_sim
+    def _reverse_action(self, act_str):
+        rev = {'FORWARD': 'BACKWARD', 'BACKWARD': 'FORWARD', 'LEFT': 'RIGHT', 'RIGHT': 'LEFT'}
+        return rev.get(act_str, 'IDLE')
 
 if __name__ == "__main__":
-    import vis_nav_game
-    
-    # Start the game with our new Autonomous Player!
-    vis_nav_game.play(the_player=AutonomousPlayer())
+    vis_nav_game.play(the_player=CNNAutonomousPlayer())
