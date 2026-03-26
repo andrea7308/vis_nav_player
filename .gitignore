@@ -10,6 +10,6 @@ wheels/
 .venv
 
 # Data
-/data/
+data/
 /cache/
 vis_nav_player.log

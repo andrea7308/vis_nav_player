@@ -69,6 +69,13 @@ class KeyboardPlayerPyGame(Player):
         self.screen = None
         self.keymap = None
         super().__init__()
+        self.prev_node = None
+        self.autonomous = True
+        self.current_path = []
+        self.path_idx = 0
+        self.last_nodes = []
+        self.recovery_mode = False
+        self.recovery_steps = 0
 
         self.subsample_rate = subsample_rate
         self.top_k_shortcuts = top_k_shortcuts
@@ -112,19 +119,96 @@ class KeyboardPlayerPyGame(Player):
         }
 
     def act(self):
+        # --- AUTONOMOUS MODE ---
+        if self.autonomous and self.database is not None and self.goal_node is not None:
+            cur = self._get_current_node()
+
+            # --- STUCK DETECTION ---
+            self.last_nodes.append(cur)
+            if len(self.last_nodes) > 10:
+                self.last_nodes.pop(0)
+
+            if len(set(self.last_nodes)) == 1:
+                print("[AUTO] STUCK → entering recovery mode")
+                self.recovery_mode = True
+                self.recovery_steps = 0
+
+            # --- RECOVERY MODE ---
+            if self.recovery_mode:
+                self.recovery_steps += 1
+
+                if self.recovery_steps > 6:
+                    print("[RECOVERY] exiting")
+                    self.recovery_mode = False
+                else:
+                    if self.recovery_steps % 2 == 1:
+                        print("[RECOVERY] turning")
+                        return Action.LEFT
+                    else:
+                        print("[RECOVERY] moving forward")
+                        return Action.FORWARD
+
+            # --- REPLAN IF NEEDED ---
+            if not self.current_path or self.path_idx >= len(self.current_path) or cur != self.current_path[self.path_idx]:
+                self.current_path = self._get_path(cur)
+                self.path_idx = 0
+
+            # --- CHECK GOAL ---
+            if len(self.current_path) <= 1:
+                print("Reached goal → CHECKIN")
+                return Action.CHECKIN
+
+            # --- FIND NEXT TEMPORAL STEP (avoid going backward) ---
+            next_node = None
+
+            for n in self.current_path[1:]:
+                if abs(n - cur) == 1:
+                    # avoid going back to previous node
+                    if self.prev_node is not None and n == self.prev_node:
+                        continue
+                    next_node = n
+                    break
+
+            if next_node is None:
+                print("[AUTO] No temporal step → exploring")
+
+                # try to move forward instead of freezing
+                return Action.FORWARD
+
+            # --- ACTION ---
+            action_str = self._edge_action(cur, next_node)
+
+            if action_str == 'BACKWARD':
+                action_str = 'FORWARD'
+
+            action_map = {
+                'FORWARD': Action.FORWARD,
+                'BACKWARD': Action.BACKWARD,
+                'LEFT': Action.LEFT,
+                'RIGHT': Action.RIGHT
+            }
+
+            action = action_map.get(action_str, Action.IDLE)
+
+            self.prev_node = cur
+
+            print(f"[AUTO] {cur} → {next_node} | action: {action_str}")
+
+            self.path_idx += 1
+            return action
+
+        # --- MANUAL MODE (fallback) ---
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 pygame.quit()
-                self.last_act = Action.QUIT
                 return Action.QUIT
             if event.type == pygame.KEYDOWN:
                 if event.key in self.keymap:
                     self.last_act |= self.keymap[event.key]
-                else:
-                    self.show_target_images()
             if event.type == pygame.KEYUP:
                 if event.key in self.keymap:
                     self.last_act ^= self.keymap[event.key]
+
         return self.last_act
 
     def see(self, fpv):
@@ -271,6 +355,9 @@ class KeyboardPlayerPyGame(Player):
             def edge_cost(u, v, d):
                 base = d["weight"]
 
+                if d["edge_type"] == "visual":
+                    base += 5.0  # penalize visual edges heavily
+
                 # similarity to goal (higher = better)
                 sim_v = float(self.database[v] @ self.database[self.goal_node])
 
@@ -289,14 +376,19 @@ class KeyboardPlayerPyGame(Player):
             return [start]
 
     def _edge_action(self, a: int, b: int) -> str:
-        """Get the action label for traversing edge a->b."""
         REVERSE = {'FORWARD': 'BACKWARD', 'BACKWARD': 'FORWARD',
-                    'LEFT': 'RIGHT', 'RIGHT': 'LEFT'}
+               'LEFT': 'RIGHT', 'RIGHT': 'LEFT'}
+        
         if b == a + 1 and a < len(self.motion_frames):
             return self.motion_frames[a]['action']
         elif b == a - 1 and b < len(self.motion_frames):
             return REVERSE.get(self.motion_frames[b]['action'], '?')
-        return '?'
+
+        # --- NEW: handle visual edges ---
+        if b > a:
+            return 'FORWARD'
+        else:
+            return 'BACKWARD'
 
     # --- Display ---
     def show_target_images(self):
