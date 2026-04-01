@@ -19,7 +19,7 @@ from tqdm import tqdm
 # Constants
 # ---------------------------------------------------------------------------
 CACHE_DIR = "cache"
-DATA_DIR = "data/exploration_data"
+DATA_DIR = "/Users/dremargon/Desktop/Spring 2026/Robot Vision/forked_repo/vis_nav_player/source/data/traj_0"
 
 # Graph construction
 TEMPORAL_WEIGHT = 1.5       # edge weight for consecutive frames
@@ -200,90 +200,50 @@ class VLADExtractor:
 # ---------------------------------------------------------------------------
 class KeyboardPlayerPyGame(Player):
 
-    def __init__(self, n_clusters: int = 128, subsample_rate: int = 5,
-                 top_k_shortcuts: int = 30):
-        self.fpv = None
-        self.last_act = Action.IDLE
-        self.screen = None
-        self.keymap = None
+    def __init__(self, n_clusters: int = 128, subsample_rate: int = 5, top_k_shortcuts: int = 30):
         super().__init__()
-
         self.subsample_rate = subsample_rate
+        self.motion_frames = []
+        self.file_list = []
         self.top_k_shortcuts = top_k_shortcuts
 
-        # Load trajectory data — supports both formats:
-        #   New: data/traj_0/, data/traj_1/, ... each with data_info.json + images
-        #   Legacy: data/images/ + data/data_info.json
-        self.motion_frames = []   # list of {step, image, action, traj_id, image_path}
-        self.file_list = []       # image paths relative to cwd
-        self.traj_boundaries = [] # (start_idx, end_idx) per trajectory in motion_frames
-
-        traj_dirs = sorted([
-            d for d in os.listdir(DATA_DIR)
-            if d.startswith('traj_') and os.path.isdir(os.path.join(DATA_DIR, d))
-        ])
-
-        if traj_dirs:
-            # New multi-trajectory format
+        # 1. Load the single trajectory (traj_0)
+        info_path = os.path.join(DATA_DIR, 'data_info.json')
+        if os.path.exists(info_path):
+            with open(info_path) as f:
+                raw = json.load(f)
+            
+            # Filter for valid actions and build absolute paths
+            pure = {'FORWARD', 'LEFT', 'RIGHT', 'BACKWARD'}
             all_motion = []
-            for traj_dir_name in traj_dirs:
-                traj_path = os.path.join(DATA_DIR, traj_dir_name)
-                info_path = os.path.join(traj_path, 'data_info.json')
-                if not os.path.exists(info_path):
-                    continue
-                with open(info_path) as f:
-                    raw = json.load(f)
-                traj_id = traj_dir_name
-                pure = {'FORWARD', 'LEFT', 'RIGHT', 'BACKWARD'}
-                traj_motion = [
-                    {'step': d['step'], 'image': d['image'], 'action': d['action'][0],
-                     'traj_id': traj_id, 'image_path': os.path.join(traj_path, d['image'])}
-                    for d in raw
-                    if len(d['action']) == 1 and d['action'][0] in pure
-                ]
-                start_idx = len(all_motion)
-                all_motion.extend(traj_motion)
-                end_idx = len(all_motion)
-                self.traj_boundaries.append((start_idx, end_idx))
-                print(f"  {traj_dir_name}: {len(traj_motion)} motion frames")
+            for d in raw:
+                # Check if the JSON provides the name, or if we need to force 0.jpg
+                img_filename = d['image'] # e.g., "0.jpg"
+                
+                # Construct the absolute path
+                img_path = os.path.join(DATA_DIR, img_filename)
+                
+                # DEBUG: Check if the file actually exists before adding it
+                if not os.path.exists(img_path):
+                    continue 
 
-            self.motion_frames = all_motion[::subsample_rate]
-            # Recompute boundaries after subsampling
-            self.traj_boundaries = []
-            prev_traj = None
-            for idx, m in enumerate(self.motion_frames):
-                if m['traj_id'] != prev_traj:
-                    if prev_traj is not None:
-                        self.traj_boundaries[-1] = (self.traj_boundaries[-1][0], idx)
-                    self.traj_boundaries.append((idx, len(self.motion_frames)))
-                    prev_traj = m['traj_id']
-            if self.traj_boundaries:
-                self.traj_boundaries[-1] = (self.traj_boundaries[-1][0], len(self.motion_frames))
+                action = d['action'][0].upper()
+                if action in pure:
+                    all_motion.append({
+                        'step': d['step'],
+                        'image': img_filename,
+                        'action': action,
+                        'image_path': img_path
+                    })
 
+            # Subsample and store
+            self.motion_frames = all_motion[::self.subsample_rate]
             self.file_list = [m['image_path'] for m in self.motion_frames]
-            print(f"Frames: {len(all_motion)} total, "
-                  f"{len(self.motion_frames)} after {subsample_rate}x subsample, "
-                  f"{len(self.traj_boundaries)} trajectories")
+            self.traj_boundaries = [(0, len(self.motion_frames))]
+            
+            print(f"Loaded {len(self.motion_frames)} frames from {DATA_DIR}")
         else:
-            # Legacy single-directory format
-            legacy_info = os.path.join(DATA_DIR, 'data_info.json')
-            legacy_img_dir = os.path.join(DATA_DIR, 'images')
-            if os.path.exists(legacy_info):
-                with open(legacy_info) as f:
-                    raw = json.load(f)
-                pure = {'FORWARD', 'LEFT', 'RIGHT', 'BACKWARD'}
-                all_motion = [
-                    {'step': d['step'], 'image': d['image'], 'action': d['action'][0],
-                     'traj_id': 'traj_0',
-                     'image_path': os.path.join(legacy_img_dir, d['image'])}
-                    for d in raw
-                    if len(d['action']) == 1 and d['action'][0] in pure
-                ]
-                self.motion_frames = all_motion[::subsample_rate]
-                self.file_list = [m['image_path'] for m in self.motion_frames]
-                self.traj_boundaries = [(0, len(self.motion_frames))]
-                print(f"Frames (legacy): {len(all_motion)} total, "
-                      f"{len(self.motion_frames)} after {subsample_rate}x subsample")
+            print(f"CRITICAL: Could not find data_info.json at {info_path}")
 
         self.extractor = VLADExtractor(n_clusters=n_clusters)
         self.database = None
@@ -683,9 +643,9 @@ if __name__ == "__main__":
     parser.add_argument("--top-k", type=int, default=30,
                         help="Number of global visual shortcut edges (default: 30)")
     args = parser.parse_args()
-
+   
     vis_nav_game.play(the_player=KeyboardPlayerPyGame(
-        n_clusters=args.n_clusters,
-        subsample_rate=args.subsample,
-        top_k_shortcuts=args.top_k,
-    ))
+            n_clusters=args.n_clusters,
+            subsample_rate=args.subsample,
+            top_k_shortcuts=args.top_k,
+        ))
