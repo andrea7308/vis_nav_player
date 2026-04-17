@@ -46,11 +46,28 @@ def verify_match_with_ransac(img1_path, img2_path, min_inliers=25, min_width_rat
     bf = cv2.BFMatcher(cv2.NORM_L2)
     matches = bf.knnMatch(des1, des2, k=2)
     
-    # Lowe's Ratio Test
+    # Lowe's Ratio Test & Orientation Constraint
     good_matches = []
+    
+    # Maximum allowed rotation between features (in degrees)
+    # 30 degrees allows for perspective shifts while turning, but blocks upside-down matches
+    max_angle_diff = 30.0 
+    
     for m, n in matches:
         if m.distance < 0.75 * n.distance:
-            good_matches.append(m)
+            
+            # Extract the angles of the matching keypoints
+            angle1 = kp1[m.queryIdx].angle
+            angle2 = kp2[m.trainIdx].angle
+            
+            # Calculate the absolute difference, accounting for the 360-degree wrap-around
+            # e.g., matching 355 degrees and 5 degrees is only a 10-degree difference
+            diff = abs(angle1 - angle2)
+            diff = min(diff, 360.0 - diff) 
+            
+            # Only keep the match if the feature is upright relative to its pair
+            if diff <= max_angle_diff:
+                good_matches.append(m)
             
     if len(good_matches) < 4:
         return False
@@ -67,8 +84,7 @@ def verify_match_with_ransac(img1_path, img2_path, min_inliers=25, min_width_rat
     if inlier_count < min_inliers:
         return False
 
-    # --- HORIZONTAL SPREAD CHECK ---
-    # Extract the (x, y) coordinates of the valid inliers in the destination image
+    # --- HORIZONTAL SPREAD & CLUSTER CHECK (SPATIAL BINNING) ---
     inlier_pts = dst_pts[mask.ravel() == 1]
     
     if len(inlier_pts) == 0:
@@ -76,15 +92,28 @@ def verify_match_with_ransac(img1_path, img2_path, min_inliers=25, min_width_rat
         
     # Isolate the X coordinates
     x_coords = inlier_pts[:, 0, 0]
-    
-    # Calculate the horizontal spread (width) of the inliers
-    inlier_width = np.max(x_coords) - np.min(x_coords)
-    
-    # Get total image width
     image_width = img2.shape[1]
     
-    # Reject if the matching features are constrained to a narrow vertical band
-    if (inlier_width / image_width) < min_width_ratio:
+    # Configuration for Spatial Binning
+    num_bins = 5             # Divide the image into 5 vertical columns
+    min_active_bins = 3      # Require matches to be present in at least 3 of those columns
+    min_pts_per_bin = 3      # Require at least 3 points in a column for it to be considered "active"
+    
+    # Create bin boundaries
+    bins = np.linspace(0, image_width, num_bins + 1)
+    
+    # Assign each x-coordinate to a bin (digitize returns 1-indexed bins, subtract 1 for 0-index)
+    bin_indices = np.digitize(x_coords, bins) - 1
+    
+    # Count how many bins meet our cluster threshold
+    active_bins = 0
+    for b in range(num_bins):
+        pts_in_bin = np.sum(bin_indices == b)
+        if pts_in_bin >= min_pts_per_bin:
+            active_bins += 1
+            
+    # Reject if the matches aren't sufficiently distributed in clusters across the image
+    if active_bins < min_active_bins:
         return False
         
     return True
