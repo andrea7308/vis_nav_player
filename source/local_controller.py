@@ -1,6 +1,7 @@
 # local_controller.py
 import math
 from enum import Enum, auto
+from visual_localizer import check_facing_forward
 
 
 class State(Enum):
@@ -9,6 +10,7 @@ class State(Enum):
     PRE_TURN   = auto()   # a turn is coming — creep forward to the turn point
     TURNING    = auto()   # executing the rotation in place
     RECOVERING = auto()   # off_course flag raised — hold and spin to relocalize
+    REORIENTING = auto()
 
 
 # ── Tuning constants ─────────────────────────────────────────────────────────
@@ -50,6 +52,8 @@ class LocalController:
         traversable_map: dict,   # output of perception_stabilizer
         off_course: bool,        # from visual_localizer
         lookahead: list[str],    # next N directions from global_planner
+        current_frame_path: str,
+        next_node_path: str,
     ) -> dict:
         """
         Run one FSM tick. Returns a motor command dict.
@@ -65,9 +69,15 @@ class LocalController:
             off_course:      True if visual_localizer lost confidence.
             lookahead:       List of upcoming directions (index 0 = next after current).
         """
+        facing_forward = check_facing_forward(current_frame_path, next_node_path)
+        if not facing_forward and direction == "FORWARD":
+            self.state = State.REORIENTING
+            self._turn_remaining = 180.0
+            self._turn_direction = 1
+            return self._stop()
 
         # ── Global interrupt: lost localisation ──────────────────────────────
-        if off_course and self.state not in (State.RECOVERING,):
+        if off_course and self.state != State.RECOVERING:
             self._enter_recovering()
 
         # ── State machine ────────────────────────────────────────────────────

@@ -182,3 +182,12 @@ def build_localizer_from_training_artefacts(
         node_img_paths=node_img_paths,
         **kwargs,
     )
+
+def check_facing_forward(current_frame_path, next_node_path):
+    """
+    Returns True if the robot appears to be facing toward the next node.
+    Uses the same RANSAC verification already in visual_localizer.
+    """
+    return verify_match_with_ransac(current_frame_path, next_node_path,
+                                    min_inliers=15,      # looser than localization
+                                    min_width_ratio=0.15) # next node is partially visible
