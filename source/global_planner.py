@@ -154,42 +154,63 @@ class GlobalPlanner:
 
     def distill_directional_intent(self, intents):
         """
-        Parses the upcoming lookahead sequence to provide a single, actionable 
-        directional intent vector for the local controller's FSM.
+        Parses the upcoming sequence to find the general direction of travel 
+        (net left vs. right) before the next major translation, feeding a 
+        high-level directional vector to the local stabilizer.
         """
         if not intents:
             return "STAY"
             
-        immediate_action = intents[0]
-        
-        # 1. If the immediate action is a complex maneuver, it becomes the sole focus
-        if "JUMP" in immediate_action or "REORIENT" in immediate_action:
-            return immediate_action
-            
-        # 2. Count how many consecutive nodes share this exact same physical action
-        consecutive_count = 1
-        for action in intents[1:]:
-            if action == immediate_action:
-                consecutive_count += 1
-            else:
-                break
-                
-        # 3. Look ahead to find the NEXT major state change 
+        net_turns = 0
         upcoming_maneuver = None
-        steps_until = None
-        for i, action in enumerate(intents[consecutive_count:], start=consecutive_count):
-            if action != immediate_action and action != "IDLE":
+        steps_until = 0
+        
+        for i, action in enumerate(intents):
+            # 1. Check for spatial translations that break the rotation sequence
+            move_cmd = action.split(' + ')[-1] if ' + ' in action else action
+            move_cmd = move_cmd.split(' ')[0] # Clean up JUMP strings
+            
+            # A spatial translation is a FORWARD move or a JUMP that isn't just an in-place alignment
+            is_spatial_jump = "JUMP" in action and "ALIGN" not in action
+            is_forward = (move_cmd == 'FORWARD')
+
+            if (is_forward or is_spatial_jump) and i > 0:
                 upcoming_maneuver = action
                 steps_until = i
                 break
+
+            # 2. Accumulate rotations
+            # RIGHT is +1 (90 deg clockwise)
+            # LEFT is -1 (90 deg counter-clockwise)
+            # Reversals are +2 (180 deg)
+            if 'RIGHT' in action:
+                net_turns += 1
+            elif 'LEFT' in action and '180' not in action:
+                net_turns -= 1
                 
-        # 4. Construct the final intent vector decision
-        intent_vector = immediate_action
+            if 'REVERSE_FLOW' in action or 'BACKWARD' in action or '180' in action:
+                net_turns += 6
+
+        # 3. Resolve the net balance into a general direction
+        # Using Modulo 12 distils directions into clock
+        net_turns = net_turns % 12
         
-        # Add spatial awareness to help the local controller prepare its state machine
-        if upcoming_maneuver:
-            # Clean up the string slightly if it's a compound reorient command
-            clean_maneuver = upcoming_maneuver.split(' + ')[-1] if ' + ' in upcoming_maneuver else upcoming_maneuver
-            intent_vector += f" | NEXT: {clean_maneuver} (in {steps_until} nodes)"
+        if net_turns >= 2 and net_turns <= 4:
+            decision = "RIGHT"
+        elif net_turns >= 5 and net_turns <= 7:
+            decision = "TURN_180"
+        elif net_turns >= 8 and net_turns <= 10:
+            decision = "LEFT"
+        else:
+            decision = "FORWARD"
             
-        return intent_vector
+        # 4. If the immediate next command is a spatial jump, preserve that exact string
+        if "JUMP" in intents[0] and "ALIGN" not in intents[0]:
+            decision = intents[0]
+
+        # 5. Append spatial awareness for the local controller's lookahead
+        if upcoming_maneuver:
+            clean_maneuver = upcoming_maneuver.split(' + ')[-1] if ' + ' in upcoming_maneuver else upcoming_maneuver
+            decision += f" | NEXT: {clean_maneuver} (in {steps_until} nodes)"
+            
+        return decision
