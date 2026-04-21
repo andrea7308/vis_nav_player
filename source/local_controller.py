@@ -1,7 +1,7 @@
 # local_controller.py
 import math
 from enum import Enum, auto
-from visual_localizer import check_facing_forward
+from train_cnn import verify_match_with_ransac
 
 
 class State(Enum):
@@ -234,3 +234,12 @@ class LocalController:
     @staticmethod
     def _stop() -> dict:
         return {"forward": 0.0, "turn": 0.0}
+    
+    def check_facing_forward(current_frame_path, next_node_path):
+        """
+        Returns True if the robot appears to be facing toward the next node.
+        Uses the same RANSAC verification already in visual_localizer.
+        """
+        return verify_match_with_ransac(current_frame_path, next_node_path,
+                                        min_inliers=15,      # looser than localization
+                                        min_width_ratio=0.15) # next node is partially visible
