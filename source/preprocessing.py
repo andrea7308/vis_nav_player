@@ -170,53 +170,75 @@ def build_topological_graph(data_list, embeddings, img_dir, time_margin=20):
 def localize_target(target_path, img_dir, data_list, embeddings, model, transform, device):
     print(f"Localizing target image: {target_path}")
     
-    # 1. target.jpg is a 2x2 mosaic. Extract the top-left quadrant (front view).
+    # 1. Load the mosaic image
     mosaic_bgr = cv2.imread(target_path)
     if mosaic_bgr is None:
         print(f"[ERROR] Could not load {target_path}")
         return 0
         
     h, w = mosaic_bgr.shape[:2]
-    front_bgr = mosaic_bgr[:h // 2, :w // 2]
-    front_rgb = cv2.cvtColor(front_bgr, cv2.COLOR_BGR2RGB)
+    ch, cw = h // 2, w // 2
     
-    # Save the cropped version temporarily so RANSAC can load it from disk
-    temp_target_path = "temp_front_target.jpg"
-    cv2.imwrite(temp_target_path, front_bgr)
+    # Define the 4 quadrants
+    quadrants = {
+        "top-left": mosaic_bgr[:ch, :cw],
+        "top-right": mosaic_bgr[:ch, cw:],
+        "bottom-left": mosaic_bgr[ch:, :cw],
+        "bottom-right": mosaic_bgr[ch:, cw:]
+    }
     
-    # 2. Convert to PIL Image and extract CNN feature
-    img = Image.fromarray(front_rgb)
-    tensor = transform(img).unsqueeze(0).to(device)
+    all_candidates = []
     
-    with torch.no_grad():
-        target_feat = model(tensor)
-        target_feat = torch.flatten(target_feat, 1)
-        target_feat = nn.functional.normalize(target_feat, p=2, dim=1)
+    # 2. Iterate through all quadrants to get CNN features and similarities
+    for quad_name, quad_bgr in quadrants.items():
+        quad_rgb = cv2.cvtColor(quad_bgr, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(quad_rgb)
+        tensor = transform(img).unsqueeze(0).to(device)
         
-    # 3. Find highest cosine similarities
-    similarities = torch.matmul(embeddings, target_feat.T).squeeze()
-    top_k_indices = torch.topk(similarities, k=5).indices.cpu().numpy()
+        with torch.no_grad():
+            target_feat = model(tensor)
+            target_feat = torch.flatten(target_feat, 1)
+            target_feat = nn.functional.normalize(target_feat, p=2, dim=1)
+            
+        similarities = torch.matmul(embeddings, target_feat.T).squeeze()
+        
+        # Get top 5 matches for this specific quadrant
+        top_k = torch.topk(similarities, k=5)
+        
+        # Store the candidate details: (similarity_score, node_index, quadrant_name, quadrant_bgr_image)
+        for score, idx in zip(top_k.values.cpu().numpy(), top_k.indices.cpu().numpy()):
+            all_candidates.append((score, int(idx), quad_name, quad_bgr))
+            
+    # 3. Sort all 20 candidates across all quadrants by similarity (highest first)
+    all_candidates.sort(key=lambda x: x[0], reverse=True)
     
-    # 4. Verify with RANSAC
-    for idx in top_k_indices:
+    temp_target_path = "temp_quadrant_target.jpg"
+    
+    # 4. Verify with RANSAC starting from the absolute best CNN match
+    for score, idx, quad_name, quad_bgr in all_candidates:
         candidate_path = os.path.join(img_dir, data_list[idx]['image'])
-        # Pass the cropped temp image to RANSAC, not the original mosaic
+        
+        # Save the specific quadrant image temporarily so RANSAC can load it
+        cv2.imwrite(temp_target_path, quad_bgr)
+        
         if verify_match_with_ransac(temp_target_path, candidate_path):
-            print(f"Target matched verified via RANSAC at Node {idx} (Similarity: {similarities[idx]:.4f})")
+            print(f"Target match verified via RANSAC at Node {idx} using the {quad_name} quadrant (Similarity: {score:.4f})")
             
             # Clean up temp file
             if os.path.exists(temp_target_path):
                 os.remove(temp_target_path)
                 
-            return int(idx)
+            return idx
             
-    # Clean up temp file if RANSAC fails
+    # Clean up temp file if RANSAC fails on every single candidate
     if os.path.exists(temp_target_path):
         os.remove(temp_target_path)
         
-    # Fallback if RANSAC fails on all top candidates
-    best_idx = int(top_k_indices[0])
-    print(f"Warning: RANSAC verification failed. Falling back to highest CNN similarity at Node {best_idx}.")
+    # 5. Fallback if RANSAC fails on all top candidates
+    best_match = all_candidates[0]
+    best_score, best_idx, best_quad = best_match[0], best_match[1], best_match[2]
+    
+    print(f"Warning: RANSAC verification failed for all quadrants. Falling back to highest CNN similarity at Node {best_idx} from the {best_quad} quadrant (Similarity: {best_score:.4f}).")
     return best_idx
 
 if __name__ == "__main__":
